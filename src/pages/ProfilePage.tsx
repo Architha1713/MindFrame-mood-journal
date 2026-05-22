@@ -1,4 +1,4 @@
-import { useState, FormEvent } from 'react';
+import { useState, useEffect, FormEvent } from 'react';
 import { User, Save, Loader, Check, Flame, BookOpen, Sparkles, Brain } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 import { supabase, CharacterStyle } from '../lib/supabase';
@@ -15,6 +15,14 @@ export default function ProfilePage() {
   const [characterStyle, setCharacterStyle] = useState<CharacterStyle>(profile?.character_style || 'neutral');
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+
+  // Sync local state when profile changes
+  useEffect(() => {
+    if (profile) {
+      setDisplayName(profile.display_name);
+      setCharacterStyle(profile.character_style);
+    }
+  }, [profile]);
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();

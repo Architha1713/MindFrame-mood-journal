@@ -30,6 +30,7 @@ export default function DashboardPage() {
   const [recentJournals, setRecentJournals] = useState<JournalEntry[]>([]);
   const [latestInsight, setLatestInsight] = useState<AiInsight | null>(null);
   const [todayMood, setTodayMood] = useState<MoodEntry | null>(null);
+  const [todayAnalysis, setTodayAnalysis] = useState<AiInsight | null>(null);
   const [loading, setLoading] = useState(true);
 
   const today = new Date().toISOString().split('T')[0];
@@ -38,16 +39,18 @@ export default function DashboardPage() {
 
   useEffect(() => {
     async function load() {
-      const [{ data: moods }, { data: journals }, { data: insights }, { data: todayMoodData }] = await Promise.all([
+      const [{ data: moods }, { data: journals }, { data: insights }, { data: todayMoodData }, { data: todayInsight }] = await Promise.all([
         supabase.from('mood_entries').select('*').order('created_at', { ascending: false }).limit(7),
         supabase.from('journal_entries').select('*').order('created_at', { ascending: false }).limit(5),
         supabase.from('ai_insights').select('*').order('created_at', { ascending: false }).limit(1),
         supabase.from('mood_entries').select('*').eq('entry_date', today).maybeSingle(),
+        supabase.from('ai_insights').select('*').eq('insight_type', 'reflection').order('created_at', { ascending: false }).limit(1).maybeSingle(),
       ]);
       setRecentMoods(moods || []);
       setRecentJournals(journals || []);
       setLatestInsight(insights?.[0] || null);
       setTodayMood(todayMoodData || null);
+      setTodayAnalysis(todayInsight || null);
       setLoading(false);
     }
     load();
@@ -125,6 +128,36 @@ export default function DashboardPage() {
             <p className="text-sm font-semibold text-white capitalize">{todayMood.mood}</p>
             <p className="text-xs text-white/30">Intensity {todayMood.intensity}/10</p>
           </div>
+        </div>
+      )}
+
+      {/* Today's AI analysis */}
+      {todayAnalysis && (
+        <div className="mb-6 rounded-2xl p-5"
+          style={{
+            background: 'rgba(0,178,178,0.06)',
+            border: '1px solid rgba(0,178,178,0.18)',
+          }}>
+          <div className="flex items-center gap-2 mb-3">
+            <Sparkles size={14} style={{ color: '#4dcaca' }} />
+            <span className="text-xs font-semibold" style={{ color: '#4dcaca' }}>Today's AI Reflection</span>
+            {todayAnalysis.wellness_score && (
+              <span className="ml-auto px-2 py-0.5 rounded-full text-[10px] font-medium"
+                style={{ background: 'rgba(0,178,178,0.12)', border: '1px solid rgba(0,178,178,0.2)', color: '#4dcaca' }}>
+                Wellness {todayAnalysis.wellness_score}/10
+              </span>
+            )}
+          </div>
+          <p className="text-sm text-white/65 leading-relaxed line-clamp-3">{todayAnalysis.insight_text}</p>
+          {todayAnalysis.recommendations?.length > 0 && (
+            <div className="mt-3 pt-3 border-t border-subtle">
+              <p className="text-[10px] text-white/35 uppercase tracking-wide mb-1.5">Top recommendation</p>
+              <p className="text-xs text-white/50">{todayAnalysis.recommendations[0]}</p>
+            </div>
+          )}
+          <Link to="/insights" className="inline-flex items-center gap-1 mt-3 text-[10px] transition-colors" style={{ color: '#4dcaca' }}>
+            View all insights <ArrowRight size={10} />
+          </Link>
         </div>
       )}
 

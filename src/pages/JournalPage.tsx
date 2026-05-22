@@ -5,11 +5,6 @@ import { supabase, MoodType, CharacterStyle, JournalEntry } from '../lib/supabas
 import MoodCompanion, { moodConfig } from '../components/MoodCompanion';
 
 const moods: MoodType[] = ['happy', 'calm', 'anxious', 'stressed', 'tired', 'excited', 'sad', 'overwhelmed'];
-const characterStyles: { value: CharacterStyle; label: string }[] = [
-  { value: 'feminine', label: 'Feminine' },
-  { value: 'masculine', label: 'Masculine' },
-  { value: 'neutral', label: 'Neutral' },
-];
 
 function MoodCheckIn({ onComplete, characterStyle }: {
   onComplete: (moodEntryId: string, mood: MoodType) => void;
@@ -105,7 +100,7 @@ function MoodCheckIn({ onComplete, characterStyle }: {
 }
 
 export default function JournalPage() {
-  const { user, profile } = useAuth();
+  const { user, profile, refreshProfile } = useAuth();
   const [characterStyle, setCharacterStyle] = useState<CharacterStyle>(profile?.character_style || 'neutral');
   const [step, setStep] = useState<'mood' | 'write'>('mood');
   const [moodEntryId, setMoodEntryId] = useState<string | null>(null);
@@ -119,13 +114,23 @@ export default function JournalPage() {
   const [analysisResult, setAnalysisResult] = useState<string | null>(null);
   const [showAnalysis, setShowAnalysis] = useState(false);
   const [showEntries, setShowEntries] = useState(false);
+  const [dailyAnalysis, setDailyAnalysis] = useState<string | null>(null);
+  const [dailyAnalysisLoading, setDailyAnalysisLoading] = useState(false);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const today = new Date().toISOString().split('T')[0];
 
+  // Sync characterStyle with profile
+  useEffect(() => {
+    if (profile?.character_style) {
+      setCharacterStyle(profile.character_style);
+    }
+  }, [profile?.character_style]);
+
   useEffect(() => {
     loadEntries();
     checkTodayMood();
+    loadDailyAnalysis();
   }, []);
 
   async function checkTodayMood() {
@@ -143,6 +148,19 @@ export default function JournalPage() {
     }
   }
 
+  async function loadDailyAnalysis() {
+    if (!user) return;
+    const { data } = await supabase
+      .from('ai_insights')
+      .select('insight_text')
+      .eq('user_id', user.id)
+      .eq('insight_type', 'reflection')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (data) setDailyAnalysis(data.insight_text);
+  }
+
   async function loadEntries() {
     if (!user) return;
     const { data } = await supabase
@@ -152,6 +170,16 @@ export default function JournalPage() {
       .order('created_at', { ascending: false })
       .limit(20);
     setEntries(data || []);
+  }
+
+  async function persistCharacterStyle(style: CharacterStyle) {
+    if (!user) return;
+    setCharacterStyle(style);
+    await supabase
+      .from('profiles')
+      .update({ character_style: style, updated_at: new Date().toISOString() })
+      .eq('id', user.id);
+    await refreshProfile();
   }
 
   function handleMoodComplete(id: string, mood: MoodType) {
@@ -202,6 +230,42 @@ export default function JournalPage() {
     await autoSave(title, content, activeEntry?.id);
     setSaving(false);
     await loadEntries();
+    // Trigger daily analysis on save
+    await triggerDailyAnalysis();
+  }
+
+  async function triggerDailyAnalysis() {
+    if (!user || dailyAnalysisLoading) return;
+    setDailyAnalysisLoading(true);
+    try {
+      const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+      const supabaseKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
+      const response = await fetch(`${supabaseUrl}/functions/v1/analyze-journal`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${supabaseKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          content,
+          mood: currentMood,
+          userId: user.id,
+          journalEntryId: activeEntry?.id,
+          moodEntryId,
+          insightType: 'reflection',
+        }),
+      });
+      if (response.ok) {
+        const data = await response.json();
+        const text = data.insight_text || 'Analysis complete.';
+        setDailyAnalysis(text);
+        setAnalysisResult(text);
+        setShowAnalysis(true);
+      }
+    } catch {
+      // silently handle
+    }
+    setDailyAnalysisLoading(false);
   }
 
   async function analyzeEntry() {
@@ -230,7 +294,9 @@ export default function JournalPage() {
 
       if (response.ok) {
         const data = await response.json();
-        setAnalysisResult(data.insight_text || data.message || 'Analysis complete.');
+        const text = data.insight_text || 'Analysis complete.';
+        setAnalysisResult(text);
+        setDailyAnalysis(text);
       } else {
         setAnalysisResult('Unable to analyze at this time. Please try again later.');
       }
@@ -261,7 +327,7 @@ export default function JournalPage() {
     <div className="page-bg min-h-screen">
       <div className="max-w-4xl mx-auto px-4 md:px-8 py-8">
         {/* Header */}
-        <div className="flex items-center justify-between mb-8">
+        <div className="flex items-start justify-between mb-8">
           <div>
             <h1 className="text-xl font-bold text-white">Journal</h1>
             <p className="text-xs text-white/40 mt-0.5">
@@ -325,20 +391,32 @@ export default function JournalPage() {
           </div>
         )}
 
-        {/* Character style selector */}
+        {/* Character style selector - persisted to profile */}
         <div className="flex items-center gap-3 mb-6">
           <span className="text-xs text-white/40">Companion style:</span>
-          {characterStyles.map(({ value, label }) => (
+          {(['feminine', 'masculine', 'neutral'] as CharacterStyle[]).map(value => (
             <button
               key={value}
-              onClick={() => setCharacterStyle(value)}
+              onClick={() => persistCharacterStyle(value)}
               className={`px-3 py-1 rounded-full text-xs transition-all ${characterStyle === value ? 'text-white' : 'text-white/40 hover:text-white/70'}`}
               style={characterStyle === value ? { background: 'rgba(0,178,178,0.15)', border: '1px solid rgba(0,178,178,0.3)', color: '#4dcaca' } : { background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.08)' }}
             >
-              {label}
+              {value.charAt(0).toUpperCase() + value.slice(1)}
             </button>
           ))}
         </div>
+
+        {/* Today's daily analysis banner */}
+        {dailyAnalysis && step === 'write' && (
+          <div className="mb-6 card relative"
+            style={{ background: 'rgba(0,178,178,0.05)', border: '1px solid rgba(0,178,178,0.15)' }}>
+            <div className="flex items-center gap-2 mb-2">
+              <Sparkles size={12} style={{ color: '#4dcaca' }} />
+              <span className="text-xs font-medium" style={{ color: '#4dcaca' }}>Today's AI Reflection</span>
+            </div>
+            <p className="text-xs text-white/60 leading-relaxed line-clamp-3">{dailyAnalysis}</p>
+          </div>
+        )}
 
         {/* Mood check-in step */}
         {step === 'mood' && (
