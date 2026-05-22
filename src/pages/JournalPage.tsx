@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Save, Sparkles, ChevronDown, ChevronUp, Plus, BookOpen, Loader, X } from 'lucide-react';
+import { Save, Sparkles, ChevronDown, ChevronUp, Plus, BookOpen, Loader, X, Clock } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 import { supabase, MoodType, CharacterStyle, JournalEntry } from '../lib/supabase';
 import MoodCompanion, { moodConfig } from '../components/MoodCompanion';
@@ -19,17 +19,16 @@ function MoodCheckIn({ onComplete, characterStyle }: {
   async function saveMood() {
     if (!selectedMood || !user) return;
     setSaving(true);
-    const today = new Date().toISOString().split('T')[0];
     const { data, error } = await supabase
       .from('mood_entries')
-      .upsert({
+      .insert({
         user_id: user.id,
         mood: selectedMood,
         intensity,
         note,
         character_style: characterStyle,
-        entry_date: today,
-      }, { onConflict: 'user_id,entry_date' })
+        entry_date: new Date().toISOString().split('T')[0],
+      })
       .select()
       .single();
     setSaving(false);
@@ -114,38 +113,32 @@ export default function JournalPage() {
   const [analysisResult, setAnalysisResult] = useState<string | null>(null);
   const [showAnalysis, setShowAnalysis] = useState(false);
   const [showEntries, setShowEntries] = useState(false);
+  const [todayMoods, setTodayMoods] = useState<{ mood: MoodType; intensity: number; created_at: string }[]>([]);
   const [dailyAnalysis, setDailyAnalysis] = useState<string | null>(null);
   const [dailyAnalysisLoading, setDailyAnalysisLoading] = useState(false);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const today = new Date().toISOString().split('T')[0];
 
-  // Sync characterStyle with profile
   useEffect(() => {
-    if (profile?.character_style) {
-      setCharacterStyle(profile.character_style);
-    }
+    if (profile?.character_style) setCharacterStyle(profile.character_style);
   }, [profile?.character_style]);
 
   useEffect(() => {
     loadEntries();
-    checkTodayMood();
+    loadTodayMoods();
     loadDailyAnalysis();
   }, []);
 
-  async function checkTodayMood() {
+  async function loadTodayMoods() {
     if (!user) return;
     const { data } = await supabase
       .from('mood_entries')
-      .select('*')
+      .select('mood, intensity, created_at')
       .eq('user_id', user.id)
       .eq('entry_date', today)
-      .maybeSingle();
-    if (data) {
-      setMoodEntryId(data.id);
-      setCurrentMood(data.mood);
-      setStep('write');
-    }
+      .order('created_at', { ascending: true });
+    setTodayMoods(data || []);
   }
 
   async function loadDailyAnalysis() {
@@ -154,7 +147,7 @@ export default function JournalPage() {
       .from('ai_insights')
       .select('insight_text')
       .eq('user_id', user.id)
-      .eq('insight_type', 'reflection')
+      .eq('insight_type', 'daily_summary')
       .order('created_at', { ascending: false })
       .limit(1)
       .maybeSingle();
@@ -186,6 +179,7 @@ export default function JournalPage() {
     setMoodEntryId(id);
     setCurrentMood(mood);
     setStep('write');
+    loadTodayMoods();
   }
 
   const autoSave = useCallback(async (t: string, c: string, entryId?: string) => {
@@ -230,7 +224,6 @@ export default function JournalPage() {
     await autoSave(title, content, activeEntry?.id);
     setSaving(false);
     await loadEntries();
-    // Trigger daily analysis on save
     await triggerDailyAnalysis();
   }
 
@@ -252,7 +245,7 @@ export default function JournalPage() {
           userId: user.id,
           journalEntryId: activeEntry?.id,
           moodEntryId,
-          insightType: 'reflection',
+          insightType: 'daily_summary',
         }),
       });
       if (response.ok) {
@@ -276,7 +269,6 @@ export default function JournalPage() {
     try {
       const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
       const supabaseKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
-
       const response = await fetch(`${supabaseUrl}/functions/v1/analyze-journal`, {
         method: 'POST',
         headers: {
@@ -291,12 +283,9 @@ export default function JournalPage() {
           moodEntryId,
         }),
       });
-
       if (response.ok) {
         const data = await response.json();
-        const text = data.insight_text || 'Analysis complete.';
-        setAnalysisResult(text);
-        setDailyAnalysis(text);
+        setAnalysisResult(data.insight_text || 'Analysis complete.');
       } else {
         setAnalysisResult('Unable to analyze at this time. Please try again later.');
       }
@@ -312,12 +301,16 @@ export default function JournalPage() {
     setContent('');
     setAnalysisResult(null);
     setShowAnalysis(false);
+    setStep('mood');
+    setCurrentMood(null);
+    setMoodEntryId(null);
   }
 
   function loadEntry(entry: JournalEntry) {
     setActiveEntry(entry);
     setTitle(entry.title);
     setContent(entry.content);
+    setStep('write');
     setShowEntries(false);
   }
 
@@ -327,7 +320,7 @@ export default function JournalPage() {
     <div className="page-bg min-h-screen">
       <div className="max-w-4xl mx-auto px-4 md:px-8 py-8">
         {/* Header */}
-        <div className="flex items-start justify-between mb-8">
+        <div className="flex items-start justify-between mb-6">
           <div>
             <h1 className="text-xl font-bold text-white">Journal</h1>
             <p className="text-xs text-white/40 mt-0.5">
@@ -336,18 +329,11 @@ export default function JournalPage() {
           </div>
 
           <div className="flex items-center gap-3">
-            {step === 'write' && currentMood && (
-              <div className="flex items-center gap-2 px-3 py-1.5 rounded-full text-xs"
-                style={{
-                  background: `${moodConfig[currentMood].color}15`,
-                  border: `1px solid ${moodConfig[currentMood].color}30`,
-                  color: moodConfig[currentMood].color,
-                }}>
-                <div className="w-1.5 h-1.5 rounded-full" style={{ background: moodConfig[currentMood].color }} />
-                {moodConfig[currentMood].label}
-              </div>
-            )}
-
+            <button onClick={newEntry}
+              className="flex items-center gap-1.5 text-xs px-3 py-2 rounded-xl transition-colors"
+              style={{ background: 'rgba(0,178,178,0.1)', border: '1px solid rgba(0,178,178,0.2)', color: '#4dcaca' }}>
+              <Plus size={12} /> New entry
+            </button>
             <button
               onClick={() => setShowEntries(!showEntries)}
               className="btn-ghost flex items-center gap-2 text-xs py-2"
@@ -358,6 +344,47 @@ export default function JournalPage() {
             </button>
           </div>
         </div>
+
+        {/* Today's mood timeline */}
+        {todayMoods.length > 0 && (
+          <div className="mb-6 card">
+            <div className="flex items-center gap-2 mb-3">
+              <Clock size={12} style={{ color: '#4dcaca' }} />
+              <span className="text-xs font-medium" style={{ color: '#4dcaca' }}>Today's emotional journey</span>
+              <span className="text-[10px] text-white/30 ml-auto">{todayMoods.length} mood{todayMoods.length !== 1 ? 's' : ''} logged</span>
+            </div>
+            <div className="flex items-center gap-1 overflow-x-auto pb-1">
+              {todayMoods.map((m, i) => {
+                const cfg = moodConfig[m.mood];
+                const time = new Date(m.created_at).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+                return (
+                  <div key={i} className="flex items-center gap-1.5 flex-shrink-0">
+                    {i > 0 && <div className="w-4 h-px bg-white/10" />}
+                    <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full"
+                      style={{ background: `${cfg.color}12`, border: `1px solid ${cfg.color}25` }}>
+                      <div className="w-1.5 h-1.5 rounded-full" style={{ background: cfg.color }} />
+                      <span className="text-[10px] font-medium capitalize" style={{ color: cfg.color }}>{m.mood}</span>
+                      <span className="text-[10px] text-white/25">{m.intensity}</span>
+                      <span className="text-[9px] text-white/20">{time}</span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* Daily analysis banner */}
+        {dailyAnalysis && step === 'write' && (
+          <div className="mb-6 card relative"
+            style={{ background: 'rgba(0,178,178,0.05)', border: '1px solid rgba(0,178,178,0.15)' }}>
+            <div className="flex items-center gap-2 mb-2">
+              <Sparkles size={12} style={{ color: '#4dcaca' }} />
+              <span className="text-xs font-medium" style={{ color: '#4dcaca' }}>Today's AI Reflection</span>
+            </div>
+            <p className="text-xs text-white/60 leading-relaxed line-clamp-3">{dailyAnalysis}</p>
+          </div>
+        )}
 
         {/* Past entries */}
         {showEntries && (
@@ -391,7 +418,7 @@ export default function JournalPage() {
           </div>
         )}
 
-        {/* Character style selector - persisted to profile */}
+        {/* Character style selector - persisted */}
         <div className="flex items-center gap-3 mb-6">
           <span className="text-xs text-white/40">Companion style:</span>
           {(['feminine', 'masculine', 'neutral'] as CharacterStyle[]).map(value => (
@@ -406,18 +433,6 @@ export default function JournalPage() {
           ))}
         </div>
 
-        {/* Today's daily analysis banner */}
-        {dailyAnalysis && step === 'write' && (
-          <div className="mb-6 card relative"
-            style={{ background: 'rgba(0,178,178,0.05)', border: '1px solid rgba(0,178,178,0.15)' }}>
-            <div className="flex items-center gap-2 mb-2">
-              <Sparkles size={12} style={{ color: '#4dcaca' }} />
-              <span className="text-xs font-medium" style={{ color: '#4dcaca' }}>Today's AI Reflection</span>
-            </div>
-            <p className="text-xs text-white/60 leading-relaxed line-clamp-3">{dailyAnalysis}</p>
-          </div>
-        )}
-
         {/* Mood check-in step */}
         {step === 'mood' && (
           <div className="card">
@@ -428,6 +443,20 @@ export default function JournalPage() {
         {/* Journal writing step */}
         {step === 'write' && (
           <div className="space-y-4 animate-fade-in">
+            {currentMood && (
+              <div className="flex items-center gap-2 px-3 py-2 rounded-xl"
+                style={{
+                  background: `${moodConfig[currentMood].color}10`,
+                  border: `1px solid ${moodConfig[currentMood].color}20`,
+                }}>
+                <div className="w-2 h-2 rounded-full" style={{ background: moodConfig[currentMood].color }} />
+                <span className="text-xs font-medium capitalize" style={{ color: moodConfig[currentMood].color }}>
+                  {moodConfig[currentMood].label}
+                </span>
+                <span className="text-[10px] text-white/25">Current mood</span>
+              </div>
+            )}
+
             <div className="card">
               <input
                 type="text"
@@ -504,16 +533,6 @@ export default function JournalPage() {
                 )}
               </div>
             )}
-
-            {/* Skip mood check-in hint */}
-            <div className="flex items-center justify-center">
-              <button
-                onClick={() => setStep('mood')}
-                className="text-xs text-white/25 hover:text-white/50 transition-colors"
-              >
-                Update today's mood
-              </button>
-            </div>
           </div>
         )}
       </div>

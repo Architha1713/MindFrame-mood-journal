@@ -16,6 +16,13 @@ interface AnalyzeRequest {
   insightType?: string;
 }
 
+interface MoodRecord {
+  mood: string;
+  intensity: number;
+  note: string;
+  created_at: string;
+}
+
 function detectEmotions(text: string): string[] {
   const emotionKeywords: Record<string, string[]> = {
     joy: ['happy', 'excited', 'grateful', 'great', 'wonderful', 'amazing', 'love', 'joyful', 'thrilled', 'content', 'pleased', 'delighted'],
@@ -40,7 +47,7 @@ function detectEmotions(text: string): string[] {
   return detected.length > 0 ? detected.slice(0, 4) : ['reflective'];
 }
 
-function calculateWellnessScore(text: string, mood?: string, emotions?: string[]): number {
+function calculateWellnessScore(text: string, mood?: string, emotions?: string[], moodHistory?: MoodRecord[]): number {
   let score = 5;
 
   const positiveIndicators = ['grateful', 'happy', 'excited', 'calm', 'peaceful', 'better', 'progress', 'growth', 'joy', 'love', 'content', 'hopeful', 'optimistic', 'resilient', 'strong'];
@@ -61,10 +68,55 @@ function calculateWellnessScore(text: string, mood?: string, emotions?: string[]
   if (emotions?.includes('resilience') || emotions?.includes('hope')) score += 1;
   if (emotions?.includes('joy') || emotions?.includes('calm')) score += 1;
 
-  return Math.max(1, Math.min(10, score));
+  // Factor in mood history for daily summary
+  if (moodHistory && moodHistory.length > 0) {
+    const avgIntensity = moodHistory.reduce((sum, m) => sum + m.intensity, 0) / moodHistory.length;
+    const positiveMoods = moodHistory.filter(m => ['happy', 'calm', 'excited'].includes(m.mood)).length;
+    const negativeMoods = moodHistory.filter(m => ['stressed', 'anxious', 'sad', 'overwhelmed'].includes(m.mood)).length;
+    const ratio = positiveMoods / moodHistory.length;
+    score = score * 0.6 + (ratio * 8 + 1) * 0.4;
+  }
+
+  return Math.max(1, Math.min(10, Math.round(score)));
 }
 
-function generateInsight(content: string, mood: string | undefined, emotions: string[], insightType: string): {
+function aggregateMoodInsight(moodHistory: MoodRecord[]): {
+  dominantMood: string;
+  moodShifts: string[];
+  averageIntensity: number;
+  moodSummary: string;
+} {
+  if (moodHistory.length === 0) {
+    return { dominantMood: 'reflective', moodShifts: [], averageIntensity: 5, moodSummary: '' };
+  }
+
+  // Count mood occurrences
+  const moodCounts: Record<string, number> = {};
+  moodHistory.forEach(m => {
+    moodCounts[m.mood] = (moodCounts[m.mood] || 0) + 1;
+  });
+  const dominantMood = Object.entries(moodCounts).sort((a, b) => b[1] - a[1])[0][0];
+
+  // Detect mood shifts
+  const moodShifts: string[] = [];
+  for (let i = 1; i < moodHistory.length; i++) {
+    if (moodHistory[i].mood !== moodHistory[i - 1].mood) {
+      moodShifts.push(`${moodHistory[i - 1].mood} to ${moodHistory[i].mood}`);
+    }
+  }
+
+  const averageIntensity = Math.round(moodHistory.reduce((sum, m) => sum + m.intensity, 0) / moodHistory.length * 10) / 10;
+
+  // Build summary
+  const uniqueMoods = [...new Set(moodHistory.map(m => m.mood))];
+  const moodSummary = uniqueMoods.length === 1
+    ? `You felt ${uniqueMoods[0]} consistently throughout the day.`
+    : `Your emotional landscape shifted through ${uniqueMoods.length} states today: ${uniqueMoods.join(', ')}.`;
+
+  return { dominantMood, moodShifts, averageIntensity, moodSummary };
+}
+
+function generateInsight(content: string, mood: string | undefined, emotions: string[], insightType: string, moodHistory?: MoodRecord[]): {
   insight_text: string;
   recommendations: string[];
   emotional_tone: string;
@@ -93,6 +145,37 @@ function generateInsight(content: string, mood: string | undefined, emotions: st
 
   let insight_text = '';
   let recommendations: string[] = [];
+
+  // Daily summary: aggregate all moods of the day
+  if (insightType === 'daily_summary' && moodHistory && moodHistory.length > 0) {
+    const { dominantMood, moodShifts, averageIntensity, moodSummary } = aggregateMoodInsight(moodHistory);
+
+    const positiveMoods = moodHistory.filter(m => ['happy', 'calm', 'excited'].includes(m.mood)).length;
+    const negativeMoods = moodHistory.filter(m => ['stressed', 'anxious', 'sad', 'overwhelmed'].includes(m.mood)).length;
+    const isOverallPositive = positiveMoods >= negativeMoods;
+
+    if (moodHistory.length === 1) {
+      insight_text = `Today you logged a single mood check-in — ${moodHistory[0].mood} at intensity ${moodHistory[0].intensity}. ${isOverallPositive ? 'This is a positive starting point for the day.' : 'It takes courage to acknowledge where you are emotionally. This awareness is the first step toward feeling better.'} As you check in throughout the day, the AI will build a richer picture of your emotional patterns. ${content ? `Your journal entry adds valuable context: it reveals ${emotions.slice(0, 2).join(' and ')} undertones in your thinking.` : ''}`;
+    } else if (moodShifts.length === 0) {
+      insight_text = `${moodSummary} This consistency suggests emotional stability — you remained in a ${dominantMood} state with an average intensity of ${averageIntensity}/10 throughout the day. ${isOverallPositive ? 'Staying in a positive emotional state is worth appreciating — it means something in your environment and mindset is supporting your wellbeing.' : 'While consistency can feel stagnant, it also means your emotional system has found a steady state. Small intentional shifts can gradually move this baseline.'}`;
+    } else {
+      insight_text = `${moodSummary} You experienced ${moodShifts.length} emotional shift${moodShifts.length > 1 ? 's' : ''} today (${moodShifts.slice(0, 3).join(', ')}), with an average intensity of ${averageIntensity}/10. ${isOverallPositive ? 'The overall trajectory leans positive — even through shifts, your emotional core remained resilient.' : 'Emotional fluctuations are a natural part of the human experience. The important thing is that you are tracking and aware of these changes.'} ${content ? `Your journal writing reveals ${emotions.slice(0, 2).join(' and ')} themes, adding depth to the mood data.` : ''}`;
+    }
+
+    recommendations = isOverallPositive
+      ? [
+          'Notice what activities or thoughts were present during your positive mood states — these are your wellbeing anchors',
+          'Capture what specifically contributed to today\'s positive emotional pattern in your next journal entry',
+          'Share your emotional awareness practice with someone you trust — it strengthens both your reflections and your connections',
+        ]
+      : [
+          'Identify the strongest emotional trigger from today and consider one small action you can take to address it',
+          'Even 5 minutes of intentional breathing or gentle movement can shift an emotional pattern',
+          'Tomorrow, try checking in with your mood at different times to build a richer emotional map',
+        ];
+
+    return { insight_text, recommendations, emotional_tone };
+  }
 
   if (insightType === 'weekly_summary') {
     insight_text = `Your emotional journey this week reflects genuine depth and self-awareness. The patterns emerging from your entries suggest a mind actively processing and navigating life's complexities. This kind of consistent self-reflection is one of the most powerful tools for emotional growth and resilience. Continue showing up for yourself through these moments of introspection — they build an invaluable inner foundation.`;
@@ -186,31 +269,112 @@ Deno.serve(async (req: Request) => {
       });
     }
 
+    // Fetch all of today's moods for daily summary aggregation
+    let moodHistory: MoodRecord[] = [];
+    if (insightType === 'daily_summary') {
+      const today = new Date().toISOString().split('T')[0];
+      const { data: todayMoods } = await supabase
+        .from('mood_entries')
+        .select('mood, intensity, note, created_at')
+        .eq('user_id', userId)
+        .eq('entry_date', today)
+        .order('created_at', { ascending: true });
+      moodHistory = (todayMoods as MoodRecord[]) || [];
+    }
+
     const emotions = detectEmotions(content);
-    const wellnessScore = calculateWellnessScore(content, mood, emotions);
-    const { insight_text, recommendations, emotional_tone } = generateInsight(content, mood, emotions, insightType);
+    const wellnessScore = calculateWellnessScore(content, mood, emotions, insightType === 'daily_summary' ? moodHistory : undefined);
+    const { insight_text, recommendations, emotional_tone } = generateInsight(content, mood, emotions, insightType, moodHistory);
 
-    const { data: insight, error } = await supabase
-      .from('ai_insights')
-      .insert({
-        user_id: userId,
-        journal_entry_id: journalEntryId || null,
-        mood_entry_id: moodEntryId || null,
-        insight_type: insightType,
-        emotional_tone,
-        primary_emotions: emotions,
-        insight_text,
-        recommendations,
-        wellness_score: wellnessScore,
-      })
-      .select()
-      .single();
+    // For daily_summary, upsert the existing daily summary instead of creating duplicates
+    let insight;
 
-    if (error) {
-      return new Response(JSON.stringify({ error: 'Failed to save insight', details: error.message }), {
-        status: 500,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      });
+    if (insightType === 'daily_summary') {
+      // Check if a daily summary already exists today
+      const today = new Date().toISOString().split('T')[0];
+      const { data: existing } = await supabase
+        .from('ai_insights')
+        .select('id')
+        .eq('user_id', userId)
+        .eq('insight_type', 'daily_summary')
+        .gte('created_at', today)
+        .maybeSingle();
+
+      if (existing) {
+        // Update existing daily summary
+        const { data: updated, error } = await supabase
+          .from('ai_insights')
+          .update({
+            journal_entry_id: journalEntryId || null,
+            mood_entry_id: moodEntryId || null,
+            emotional_tone,
+            primary_emotions: emotions,
+            insight_text,
+            recommendations,
+            wellness_score: wellnessScore,
+          })
+          .eq('id', existing.id)
+          .select()
+          .single();
+
+        if (error) {
+          return new Response(JSON.stringify({ error: 'Failed to update insight', details: error.message }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+        insight = updated;
+      } else {
+        // Create new daily summary
+        const { data: created, error } = await supabase
+          .from('ai_insights')
+          .insert({
+            user_id: userId,
+            journal_entry_id: journalEntryId || null,
+            mood_entry_id: moodEntryId || null,
+            insight_type: insightType,
+            emotional_tone,
+            primary_emotions: emotions,
+            insight_text,
+            recommendations,
+            wellness_score: wellnessScore,
+          })
+          .select()
+          .single();
+
+        if (error) {
+          return new Response(JSON.stringify({ error: 'Failed to save insight', details: error.message }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+        insight = created;
+      }
+    } else {
+      // Regular per-entry insight
+      const { data: created, error } = await supabase
+        .from('ai_insights')
+        .insert({
+          user_id: userId,
+          journal_entry_id: journalEntryId || null,
+          mood_entry_id: moodEntryId || null,
+          insight_type: insightType,
+          emotional_tone,
+          primary_emotions: emotions,
+          insight_text,
+          recommendations,
+          wellness_score: wellnessScore,
+        })
+        .select()
+        .single();
+
+      if (error) {
+        return new Response(JSON.stringify({ error: 'Failed to save insight', details: error.message }), {
+          status: 500,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
+      }
+      insight = created;
     }
 
     return new Response(JSON.stringify(insight), {

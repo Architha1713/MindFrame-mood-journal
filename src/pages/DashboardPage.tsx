@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { BookOpen, Sparkles, BarChart2, Flame, ArrowRight, Plus, Brain, TrendingUp } from 'lucide-react';
+import { BookOpen, Sparkles, BarChart2, Flame, ArrowRight, Plus, Brain, TrendingUp, Clock } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
-import { supabase, MoodEntry, JournalEntry, AiInsight } from '../lib/supabase';
+import { supabase, MoodEntry, JournalEntry, AiInsight, MoodType } from '../lib/supabase';
 import { moodConfig } from '../components/MoodCompanion';
 
 function StatCard({ label, value, sub, color, icon: Icon }: {
@@ -29,7 +29,7 @@ export default function DashboardPage() {
   const [recentMoods, setRecentMoods] = useState<MoodEntry[]>([]);
   const [recentJournals, setRecentJournals] = useState<JournalEntry[]>([]);
   const [latestInsight, setLatestInsight] = useState<AiInsight | null>(null);
-  const [todayMood, setTodayMood] = useState<MoodEntry | null>(null);
+  const [todayMoods, setTodayMoods] = useState<MoodEntry[]>([]);
   const [todayAnalysis, setTodayAnalysis] = useState<AiInsight | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -39,17 +39,17 @@ export default function DashboardPage() {
 
   useEffect(() => {
     async function load() {
-      const [{ data: moods }, { data: journals }, { data: insights }, { data: todayMoodData }, { data: todayInsight }] = await Promise.all([
+      const [{ data: moods }, { data: journals }, { data: insights }, { data: todayMoodsData }, { data: todayInsight }] = await Promise.all([
         supabase.from('mood_entries').select('*').order('created_at', { ascending: false }).limit(7),
         supabase.from('journal_entries').select('*').order('created_at', { ascending: false }).limit(5),
         supabase.from('ai_insights').select('*').order('created_at', { ascending: false }).limit(1),
-        supabase.from('mood_entries').select('*').eq('entry_date', today).maybeSingle(),
-        supabase.from('ai_insights').select('*').eq('insight_type', 'reflection').order('created_at', { ascending: false }).limit(1).maybeSingle(),
+        supabase.from('mood_entries').select('*').eq('entry_date', today).order('created_at', { ascending: true }),
+        supabase.from('ai_insights').select('*').eq('insight_type', 'daily_summary').order('created_at', { ascending: false }).limit(1).maybeSingle(),
       ]);
       setRecentMoods(moods || []);
       setRecentJournals(journals || []);
       setLatestInsight(insights?.[0] || null);
-      setTodayMood(todayMoodData || null);
+      setTodayMoods(todayMoodsData || []);
       setTodayAnalysis(todayInsight || null);
       setLoading(false);
     }
@@ -71,6 +71,12 @@ export default function DashboardPage() {
   }, {} as Record<string, number>);
   const dominantMood = Object.entries(moodCounts).sort((a, b) => b[1] - a[1])[0]?.[0];
 
+  // Today's dominant mood from all entries
+  const todayDominant = todayMoods.length > 0
+    ? Object.entries(todayMoods.reduce((acc, m) => { acc[m.mood] = (acc[m.mood] || 0) + 1; return acc; }, {} as Record<string, number>))
+        .sort((a, b) => b[1] - a[1])[0]?.[0]
+    : null;
+
   return (
     <div className="page-bg min-h-screen p-6 md:p-8 lg:p-10">
       {/* Header */}
@@ -89,8 +95,8 @@ export default function DashboardPage() {
         </Link>
       </div>
 
-      {/* Today's mood CTA or today mood display */}
-      {!todayMood ? (
+      {/* Today's mood section */}
+      {todayMoods.length === 0 ? (
         <Link to="/journal" className="block mb-6">
           <div className="rounded-2xl p-5 flex items-center gap-4 transition-all duration-300 hover:scale-[1.01]"
             style={{
@@ -109,24 +115,39 @@ export default function DashboardPage() {
           </div>
         </Link>
       ) : (
-        <div className="mb-6 rounded-2xl p-5 flex items-center gap-4"
+        <div className="mb-6 rounded-2xl p-5"
           style={{
-            background: `${moodConfig[todayMood.mood as keyof typeof moodConfig]?.color}12`,
-            border: `1px solid ${moodConfig[todayMood.mood as keyof typeof moodConfig]?.color}25`,
+            background: todayDominant ? `${moodConfig[todayDominant as MoodType]?.color}0a` : 'rgba(255,255,255,0.03)',
+            border: todayDominant ? `1px solid ${moodConfig[todayDominant as MoodType]?.color}20` : '1px solid rgba(255,255,255,0.06)',
           }}>
-          <div className="w-12 h-12 rounded-xl flex items-center justify-center"
-            style={{
-              background: `${moodConfig[todayMood.mood as keyof typeof moodConfig]?.color}20`,
-              border: `1px solid ${moodConfig[todayMood.mood as keyof typeof moodConfig]?.color}35`,
-            }}>
-            <span className="text-sm font-bold capitalize" style={{ color: moodConfig[todayMood.mood as keyof typeof moodConfig]?.color }}>
-              {todayMood.mood.charAt(0).toUpperCase()}
-            </span>
+          <div className="flex items-center gap-2 mb-3">
+            <Clock size={13} style={{ color: '#4dcaca' }} />
+            <span className="text-xs font-semibold" style={{ color: '#4dcaca' }}>Today's emotional journey</span>
+            <span className="text-[10px] text-white/30 ml-auto">{todayMoods.length} mood{todayMoods.length !== 1 ? 's' : ''}</span>
           </div>
-          <div>
-            <p className="text-xs text-white/40">Today's mood</p>
-            <p className="text-sm font-semibold text-white capitalize">{todayMood.mood}</p>
-            <p className="text-xs text-white/30">Intensity {todayMood.intensity}/10</p>
+          <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
+            {todayMoods.map((m, i) => {
+              const cfg = moodConfig[m.mood as MoodType];
+              const time = new Date(m.created_at).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+              return (
+                <div key={m.id} className="flex items-center gap-1.5 flex-shrink-0">
+                  {i > 0 && (
+                    <div className="flex items-center gap-0.5">
+                      <div className="w-1.5 h-1.5 rounded-full" style={{ background: moodConfig[todayMoods[i-1].mood as MoodType]?.color, opacity: 0.4 }} />
+                      <div className="w-3 h-px" style={{ background: 'rgba(255,255,255,0.08)' }} />
+                      <div className="w-1.5 h-1.5 rounded-full" style={{ background: cfg?.color, opacity: 0.4 }} />
+                    </div>
+                  )}
+                  <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full"
+                    style={{ background: `${cfg?.color}12`, border: `1px solid ${cfg?.color}25` }}>
+                    <div className="w-1.5 h-1.5 rounded-full" style={{ background: cfg?.color }} />
+                    <span className="text-[10px] font-medium capitalize" style={{ color: cfg?.color }}>{m.mood}</span>
+                    <span className="text-[10px] text-white/25">{m.intensity}</span>
+                    <span className="text-[9px] text-white/20">{time}</span>
+                  </div>
+                </div>
+              );
+            })}
           </div>
         </div>
       )}
@@ -291,7 +312,7 @@ export default function DashboardPage() {
               ) : (
                 <div className="space-y-2">
                   {weekMoods.slice(0, 5).map(mood => {
-                    const cfg = moodConfig[mood.mood as keyof typeof moodConfig];
+                    const cfg = moodConfig[mood.mood as MoodType];
                     return (
                       <div key={mood.id} className="flex items-center gap-3">
                         <div className="w-2 h-2 rounded-full flex-shrink-0" style={{ background: cfg?.color }} />
