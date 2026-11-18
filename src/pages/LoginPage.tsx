@@ -90,6 +90,11 @@ export default function LoginPage() {
                   {showPassword ? <EyeOff size={15} /> : <Eye size={15} />}
                 </button>
               </div>
+              <div className="mt-2 text-right">
+                <Link to="/forgot-password" className="text-[11px] font-medium transition-colors hover:underline" style={{ color: '#4dcaca' }}>
+                  Forgot password?
+                </Link>
+              </div>
             </div>
 
             <button
