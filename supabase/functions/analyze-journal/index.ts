@@ -1,16 +1,27 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2";
 
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
-};
+// Restrict CORS to the app's origin. The ALLOWED_ORIGINS env var should be set
+// to the deployed app origin (e.g. https://mindframe.bolt.app). In development
+// we fall back to localhost origins so local testing still works.
+const APP_ORIGIN = Deno.env.get("APP_ORIGIN") || "";
+const DEV_ORIGINS = ["http://localhost:5173", "http://localhost:3000"];
+
+function corsHeaders(origin: string | null) {
+  const allowed =
+    (APP_ORIGIN && origin === APP_ORIGIN) ||
+    (origin && DEV_ORIGINS.includes(origin));
+  return {
+    "Access-Control-Allow-Origin": allowed && origin ? origin : "null",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
+    "Vary": "Origin",
+  };
+}
 
 interface AnalyzeRequest {
   content?: string;
   mood?: string;
-  userId: string;
   journalEntryId?: string;
   moodEntryId?: string;
   insightType?: string;
@@ -23,56 +34,142 @@ interface MoodRecord {
   created_at: string;
 }
 
-function detectEmotions(text: string): string[] {
-  const emotionKeywords: Record<string, string[]> = {
-    joy: ['happy', 'excited', 'grateful', 'great', 'wonderful', 'amazing', 'love', 'joyful', 'thrilled', 'content', 'pleased', 'delighted'],
-    sadness: ['sad', 'crying', 'depressed', 'lonely', 'miss', 'lost', 'grief', 'heartbroken', 'down', 'blue', 'unhappy', 'disappointed'],
-    anxiety: ['anxious', 'worried', 'nervous', 'scared', 'fear', 'panic', 'stress', 'overwhelm', 'dread', 'tense', 'uneasy', 'apprehensive'],
-    anger: ['angry', 'frustrated', 'mad', 'upset', 'annoyed', 'irritated', 'furious', 'rage', 'resentful', 'agitated'],
-    calm: ['peaceful', 'calm', 'serene', 'relaxed', 'tranquil', 'centered', 'grounded', 'still', 'balanced', 'at ease'],
-    fatigue: ['tired', 'exhausted', 'drained', 'weary', 'sleepy', 'burned out', 'depleted', 'fatigued', 'worn out'],
-    hope: ['hopeful', 'optimistic', 'better', 'improve', 'forward', 'growth', 'progress', 'possibility', 'future', 'looking forward'],
-    resilience: ['strong', 'resilient', 'overcome', 'cope', 'manage', 'handle', 'power through', 'determined', 'persist', 'despite'],
-  };
+// ---------- Crisis detection ----------
+// Word-boundary matching for self-harm / severe distress phrases. Detection is
+// NOT guaranteed — this is a best-effort keyword check, not a clinical tool.
+const CRISIS_PATTERNS: RegExp[] = [
+  /\bkill\s+myself\b/i,
+  /\bend\s+my\s+life\b/i,
+  /\bwant\s+to\s+die\b/i,
+  /\bself[\s-]?harm\b/i,
+  /\bno\s+reason\s+to\s+live\b/i,
+  /\bcan'?t\s+go\s+on\b/i,
+  /\bbetter\s+off\s+dead\b/i,
+  /\bnot\s+worth\s+living\b/i,
+  /\bend\s+it\s+all\b/i,
+  /\bsuicid/i,
+  /\btake\s+my\s+own\s+life\b/i,
+];
 
+function isCrisis(text: string): boolean {
+  return CRISIS_PATTERNS.some((re) => re.test(text));
+}
+
+function crisisResponse() {
+  return {
+    crisis: true as const,
+    insight_text:
+      "What you're describing sounds really heavy, and you don't have to carry it alone. " +
+      "Please consider reaching out to someone you trust right now — a friend, family member, or a helpline. " +
+      "If you are in immediate danger, contact your local emergency services. " +
+      "Helpline (India): Tele-MANAS 14416. Please verify the number for your region. " +
+      "Note: this message is triggered by keyword matching and detection is not guaranteed.",
+    recommendations: [
+      "Contact someone you trust and let them know what you're going through",
+      "Tele-MANAS (India): 14416 — please verify the helpline for your region",
+      "If you are in immediate danger, contact local emergency services",
+    ],
+    emotional_tone: "distressed",
+    primary_emotions: ["distress"],
+    wellness_score: null,
+    resources: [
+      { label: "Tele-MANAS India", number: "14416" },
+      { label: "Local emergency services", number: "Verify for your region" },
+    ],
+  };
+}
+
+// ---------- Emotion detection with word-boundary + negation ----------
+const emotionKeywords: Record<string, string[]> = {
+  joy: ["happy", "excited", "grateful", "great", "wonderful", "amazing", "love", "joyful", "thrilled", "content", "pleased", "delighted"],
+  sadness: ["sad", "crying", "depressed", "lonely", "lost", "grief", "heartbroken", "down", "blue", "unhappy", "disappointed", "miss"],
+  anxiety: ["anxious", "worried", "nervous", "scared", "fear", "panic", "stress", "overwhelm", "dread", "tense", "uneasy", "apprehensive"],
+  anger: ["angry", "frustrated", "mad", "upset", "annoyed", "irritated", "furious", "rage", "resentful", "agitated"],
+  calm: ["peaceful", "calm", "serene", "relaxed", "tranquil", "centered", "grounded", "still", "balanced"],
+  fatigue: ["tired", "exhausted", "drained", "weary", "sleepy", "depleted", "fatigued"],
+  hope: ["hopeful", "optimistic", "better", "improve", "forward", "growth", "progress", "possibility", "future"],
+  resilience: ["strong", "resilient", "overcome", "cope", "manage", "handle", "determined", "persist", "despite"],
+};
+
+const negationWords = ["not", "no", "never", "without", "don't", "doesn't", "didn't", "isn't", "aren't", "wasn't", "weren't", "can't", "cannot", "couldn't", "won't", "wouldn't"];
+
+function wordBoundaryMatch(text: string, keyword: string): { match: boolean; negated: boolean } {
+  const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(`(^|[^a-z])${escaped}([^a-z]|$)`, "gi");
+  const matches = [...text.matchAll(pattern)];
+  if (matches.length === 0) return { match: false, negated: false };
+  let negated = false;
+  for (const m of matches) {
+    const startIdx = m.index ?? 0;
+    const before = text.slice(Math.max(0, startIdx - 30), startIdx).toLowerCase();
+    const window = before.split(/[^a-z']+/).slice(-3);
+    if (window.some((w) => negationWords.includes(w))) {
+      negated = true;
+    }
+  }
+  return { match: true, negated };
+}
+
+function detectEmotions(text: string): { emotions: string[]; negated: string[] } {
   const lowerText = text.toLowerCase();
   const detected: string[] = [];
-
+  const negated: string[] = [];
   for (const [emotion, keywords] of Object.entries(emotionKeywords)) {
-    if (keywords.some(kw => lowerText.includes(kw))) {
-      detected.push(emotion);
+    let found = false;
+    let isNegated = false;
+    for (const kw of keywords) {
+      const { match, negated: neg } = wordBoundaryMatch(lowerText, kw);
+      if (match) {
+        found = true;
+        if (neg) isNegated = true;
+      }
+    }
+    if (found) {
+      if (isNegated && !detected.includes(emotion)) {
+        negated.push(emotion);
+      } else if (!isNegated) {
+        detected.push(emotion);
+      }
+    }
+  }
+  return { emotions: detected.length > 0 ? detected.slice(0, 4) : ["reflective"], negated };
+}
+
+function calculateMoodScore(text: string, mood: string | undefined, emotions: string[], negated: string[], moodHistory?: MoodRecord[]): number {
+  let score = 5;
+  const positiveIndicators = ["grateful", "happy", "excited", "calm", "peaceful", "better", "progress", "growth", "joy", "love", "content", "hopeful", "optimistic", "resilient", "strong"];
+  const negativeIndicators = ["stressed", "anxious", "sad", "depressed", "overwhelmed", "tired", "exhausted", "panic", "fear", "hopeless", "struggling"];
+
+  let positiveCount = 0;
+  let negativeCount = 0;
+  for (const w of positiveIndicators) {
+    const { match, negated: neg } = wordBoundaryMatch(text.toLowerCase(), w);
+    if (match) {
+      if (neg) negativeCount++;
+      else positiveCount++;
+    }
+  }
+  for (const w of negativeIndicators) {
+    const { match, negated: neg } = wordBoundaryMatch(text.toLowerCase(), w);
+    if (match) {
+      if (neg) positiveCount++;
+      else negativeCount++;
     }
   }
 
-  return detected.length > 0 ? detected.slice(0, 4) : ['reflective'];
-}
-
-function calculateWellnessScore(text: string, mood?: string, emotions?: string[], moodHistory?: MoodRecord[]): number {
-  let score = 5;
-
-  const positiveIndicators = ['grateful', 'happy', 'excited', 'calm', 'peaceful', 'better', 'progress', 'growth', 'joy', 'love', 'content', 'hopeful', 'optimistic', 'resilient', 'strong'];
-  const negativeIndicators = ['stressed', 'anxious', 'sad', 'depressed', 'overwhelmed', 'tired', 'exhausted', 'panic', 'fear', 'hopeless', 'burned out', 'struggling'];
-
-  const lowerText = text.toLowerCase();
-  let positiveCount = positiveIndicators.filter(w => lowerText.includes(w)).length;
-  let negativeCount = negativeIndicators.filter(w => lowerText.includes(w)).length;
-
-  if (mood === 'happy' || mood === 'excited' || mood === 'calm') score += 2;
-  if (mood === 'stressed' || mood === 'overwhelmed' || mood === 'anxious') score -= 2;
-  if (mood === 'sad') score -= 1;
-  if (mood === 'tired') score -= 1;
+  if (mood === "happy" || mood === "excited" || mood === "calm") score += 2;
+  if (mood === "stressed" || mood === "overwhelmed" || mood === "anxious") score -= 2;
+  if (mood === "sad") score -= 1;
+  if (mood === "tired") score -= 1;
 
   score += Math.min(positiveCount, 3);
   score -= Math.min(negativeCount, 3);
 
-  if (emotions?.includes('resilience') || emotions?.includes('hope')) score += 1;
-  if (emotions?.includes('joy') || emotions?.includes('calm')) score += 1;
+  if ((emotions.includes("resilience") || emotions.includes("hope")) && !negated.includes("resilience")) score += 1;
+  if ((emotions.includes("joy") || emotions.includes("calm")) && !negated.includes("joy")) score += 1;
 
-  // Factor in mood history for daily summary
   if (moodHistory && moodHistory.length > 0) {
-    const avgIntensity = moodHistory.reduce((sum, m) => sum + m.intensity, 0) / moodHistory.length;
-    const positiveMoods = moodHistory.filter(m => ['happy', 'calm', 'excited'].includes(m.mood)).length;
-    const negativeMoods = moodHistory.filter(m => ['stressed', 'anxious', 'sad', 'overwhelmed'].includes(m.mood)).length;
+    const positiveMoods = moodHistory.filter((m) => ["happy", "calm", "excited"].includes(m.mood)).length;
     const ratio = positiveMoods / moodHistory.length;
     score = score * 0.6 + (ratio * 8 + 1) * 0.4;
   }
@@ -80,169 +177,185 @@ function calculateWellnessScore(text: string, mood?: string, emotions?: string[]
   return Math.max(1, Math.min(10, Math.round(score)));
 }
 
-function aggregateMoodInsight(moodHistory: MoodRecord[]): {
-  dominantMood: string;
-  moodShifts: string[];
-  averageIntensity: number;
-  moodSummary: string;
-} {
+function aggregateMoodInsight(moodHistory: MoodRecord[]) {
   if (moodHistory.length === 0) {
-    return { dominantMood: 'reflective', moodShifts: [], averageIntensity: 5, moodSummary: '' };
+    return { dominantMood: "reflective", moodShifts: [] as string[], averageIntensity: 5, moodSummary: "" };
   }
-
-  // Count mood occurrences
   const moodCounts: Record<string, number> = {};
-  moodHistory.forEach(m => {
-    moodCounts[m.mood] = (moodCounts[m.mood] || 0) + 1;
-  });
+  moodHistory.forEach((m) => { moodCounts[m.mood] = (moodCounts[m.mood] || 0) + 1; });
   const dominantMood = Object.entries(moodCounts).sort((a, b) => b[1] - a[1])[0][0];
-
-  // Detect mood shifts
   const moodShifts: string[] = [];
   for (let i = 1; i < moodHistory.length; i++) {
     if (moodHistory[i].mood !== moodHistory[i - 1].mood) {
       moodShifts.push(`${moodHistory[i - 1].mood} to ${moodHistory[i].mood}`);
     }
   }
-
-  const averageIntensity = Math.round(moodHistory.reduce((sum, m) => sum + m.intensity, 0) / moodHistory.length * 10) / 10;
-
-  // Build summary
-  const uniqueMoods = [...new Set(moodHistory.map(m => m.mood))];
+  const averageIntensity = Math.round((moodHistory.reduce((sum, m) => sum + m.intensity, 0) / moodHistory.length) * 10) / 10;
+  const uniqueMoods = [...new Set(moodHistory.map((m) => m.mood))];
   const moodSummary = uniqueMoods.length === 1
-    ? `You felt ${uniqueMoods[0]} consistently throughout the day.`
-    : `Your emotional landscape shifted through ${uniqueMoods.length} states today: ${uniqueMoods.join(', ')}.`;
-
+    ? `You logged ${uniqueMoods[0]} consistently today.`
+    : `Your mood entries span ${uniqueMoods.length} states today: ${uniqueMoods.join(", ")}.`;
   return { dominantMood, moodShifts, averageIntensity, moodSummary };
 }
 
-function generateInsight(content: string, mood: string | undefined, emotions: string[], insightType: string, moodHistory?: MoodRecord[]): {
-  insight_text: string;
-  recommendations: string[];
-  emotional_tone: string;
-} {
+// ---------- Reflection templates (cautious wording, two tones) ----------
+type Tone = "neutral" | "warm";
+
+function generateInsight(
+  content: string,
+  mood: string | undefined,
+  emotions: string[],
+  negated: string[],
+  insightType: string,
+  tone: Tone,
+  moodHistory?: MoodRecord[],
+) {
   const wordCount = content.trim().split(/\s+/).filter(Boolean).length;
-  const hasReflection = emotions.includes('reflective') || emotions.includes('resilience');
-  const hasAnxiety = emotions.includes('anxiety');
-  const hasSadness = emotions.includes('sadness');
-  const hasJoy = emotions.includes('joy');
-  const hasFatigue = emotions.includes('fatigue');
-  const hasCalmness = emotions.includes('calm');
-  const hasHope = emotions.includes('hope');
+  const hasReflection = emotions.includes("reflective") || emotions.includes("resilience");
+  const hasAnxiety = emotions.includes("anxiety");
+  const hasSadness = emotions.includes("sadness");
+  const hasJoy = emotions.includes("joy");
+  const hasFatigue = emotions.includes("fatigue");
+  const hasCalmness = emotions.includes("calm");
+  const hasHope = emotions.includes("hope");
+
+  const toneLabel = tone === "warm" ? "warm and supportive" : "neutral and analytical";
 
   const tones: Record<string, string> = {
-    anxiety: 'tense and worried',
-    sadness: 'melancholic and introspective',
-    joy: 'bright and energetic',
-    calm: 'serene and centered',
-    fatigue: 'drained and heavy',
-    hope: 'forward-looking and optimistic',
-    resilience: 'strong and determined',
-    reflective: 'thoughtful and contemplative',
+    anxiety: "associated with tension and worry",
+    sadness: "associated with low mood",
+    joy: "associated with positive affect",
+    calm: "associated with calm",
+    fatigue: "associated with tiredness",
+    hope: "associated with forward-looking words",
+    resilience: "associated with coping language",
+    reflective: "associated with reflective words",
   };
+  const emotional_tone = emotions.length > 0 ? (tones[emotions[0]] || "associated with reflective words") : "associated with reflective words";
 
-  const emotional_tone = emotions.length > 0 ? (tones[emotions[0]] || 'thoughtful and introspective') : 'thoughtful and introspective';
-
-  let insight_text = '';
-  let recommendations: string[] = [];
-
-  // Daily summary: aggregate all moods of the day
-  if (insightType === 'daily_summary' && moodHistory && moodHistory.length > 0) {
+  // Daily summary
+  if (insightType === "daily_summary" && moodHistory && moodHistory.length > 0) {
     const { dominantMood, moodShifts, averageIntensity, moodSummary } = aggregateMoodInsight(moodHistory);
-
-    const positiveMoods = moodHistory.filter(m => ['happy', 'calm', 'excited'].includes(m.mood)).length;
-    const negativeMoods = moodHistory.filter(m => ['stressed', 'anxious', 'sad', 'overwhelmed'].includes(m.mood)).length;
+    const positiveMoods = moodHistory.filter((m) => ["happy", "calm", "excited"].includes(m.mood)).length;
+    const negativeMoods = moodHistory.filter((m) => ["stressed", "anxious", "sad", "overwhelmed"].includes(m.mood)).length;
     const isOverallPositive = positiveMoods >= negativeMoods;
 
+    const negatedNote = negated.length > 0 ? ` (Note: your entry also includes words such as "not ${negated[0]}", which the rules do not count toward that emotion.)` : "";
+
     if (moodHistory.length === 1) {
-      insight_text = `Today you logged a single mood check-in — ${moodHistory[0].mood} at intensity ${moodHistory[0].intensity}. ${isOverallPositive ? 'This is a positive starting point for the day.' : 'It takes courage to acknowledge where you are emotionally. This awareness is the first step toward feeling better.'} As you check in throughout the day, the AI will build a richer picture of your emotional patterns. ${content ? `Your journal entry adds valuable context: it reveals ${emotions.slice(0, 2).join(' and ')} undertones in your thinking.` : ''}`;
+      insight_text = tone === "warm"
+        ? `Today you logged one mood check-in — ${moodHistory[0].mood} at intensity ${moodHistory[0].intensity}. ${isOverallPositive ? "That is a gentle, positive starting point." : "It takes courage to name where you are emotionally."} ${content ? `Your entry includes words associated with ${emotions.slice(0, 2).join(" and ")}.${negatedNote}` : ""} (Automated reflection; not a therapist or medical advice.)`
+        : `One mood entry today: ${moodHistory[0].mood}, intensity ${moodHistory[0].intensity}/10. ${content ? `Detected word associations: ${emotions.slice(0, 2).join(", ")}.${negatedNote}` : ""} (Automated reflection; keyword-based, not clinical advice.)`;
     } else if (moodShifts.length === 0) {
-      insight_text = `${moodSummary} This consistency suggests emotional stability — you remained in a ${dominantMood} state with an average intensity of ${averageIntensity}/10 throughout the day. ${isOverallPositive ? 'Staying in a positive emotional state is worth appreciating — it means something in your environment and mindset is supporting your wellbeing.' : 'While consistency can feel stagnant, it also means your emotional system has found a steady state. Small intentional shifts can gradually move this baseline.'}`;
+      insight_text = tone === "warm"
+        ? `${moodSummary} This consistency may suggest a steady emotional state around "${dominantMood}", average intensity ${averageIntensity}/10. ${isOverallPositive ? "It is okay to appreciate a steady positive day." : "A steady low state is worth noticing; small shifts are still possible."} ${content ? `Your entry includes words associated with ${emotions.slice(0, 2).join(" and ")}.${negatedNote}` : ""} (Automated reflection; not a therapist or medical advice.)`
+        : `${moodSummary} No mood shifts across entries; dominant "${dominantMood}", average intensity ${averageIntensity}/10. ${content ? `Word associations: ${emotions.slice(0, 2).join(", ")}.${negatedNote}` : ""} (Automated reflection; keyword-based, not clinical advice.)`;
     } else {
-      insight_text = `${moodSummary} You experienced ${moodShifts.length} emotional shift${moodShifts.length > 1 ? 's' : ''} today (${moodShifts.slice(0, 3).join(', ')}), with an average intensity of ${averageIntensity}/10. ${isOverallPositive ? 'The overall trajectory leans positive — even through shifts, your emotional core remained resilient.' : 'Emotional fluctuations are a natural part of the human experience. The important thing is that you are tracking and aware of these changes.'} ${content ? `Your journal writing reveals ${emotions.slice(0, 2).join(' and ')} themes, adding depth to the mood data.` : ''}`;
+      insight_text = tone === "warm"
+        ? `${moodSummary} Your entries show ${moodShifts.length} shift${moodShifts.length > 1 ? "s" : ""} (${moodShifts.slice(0, 3).join(", ")}), average intensity ${averageIntensity}/10. ${isOverallPositive ? "Even through shifts, the overall pattern leans positive." : "Mood fluctuations are common; tracking them is a helpful first step."} ${content ? `Your entry includes words associated with ${emotions.slice(0, 2).join(" and ")}.${negatedNote}` : ""} (Automated reflection; not a therapist or medical advice.)`
+        : `${moodSummary} ${moodShifts.length} shift${moodShifts.length > 1 ? "s" : ""} recorded (${moodShifts.slice(0, 3).join(", ")}), average intensity ${averageIntensity}/10. ${content ? `Word associations: ${emotions.slice(0, 2).join(", ")}.${negatedNote}` : ""} (Automated reflection; keyword-based, not clinical advice.)`;
     }
 
     recommendations = isOverallPositive
       ? [
-          'Notice what activities or thoughts were present during your positive mood states — these are your wellbeing anchors',
-          'Capture what specifically contributed to today\'s positive emotional pattern in your next journal entry',
-          'Share your emotional awareness practice with someone you trust — it strengthens both your reflections and your connections',
+          "Consider noting what was present during positive mood entries — these are observations, not conclusions",
+          "If helpful, record what may have contributed to today's pattern in your next entry",
+          "Sharing your reflection practice with someone you trust can complement it",
         ]
       : [
-          'Identify the strongest emotional trigger from today and consider one small action you can take to address it',
-          'Even 5 minutes of intentional breathing or gentle movement can shift an emotional pattern',
-          'Tomorrow, try checking in with your mood at different times to build a richer emotional map',
+          "Consider identifying the strongest feeling from today and one small, optional action",
+          "Brief breathing or gentle movement may help shift an emotional state",
+          "Checking in at different times of day can build a fuller picture over time",
         ];
 
     return { insight_text, recommendations, emotional_tone };
   }
 
-  if (insightType === 'weekly_summary') {
-    insight_text = `Your emotional journey this week reflects genuine depth and self-awareness. The patterns emerging from your entries suggest a mind actively processing and navigating life's complexities. This kind of consistent self-reflection is one of the most powerful tools for emotional growth and resilience. Continue showing up for yourself through these moments of introspection — they build an invaluable inner foundation.`;
+  let insight_text = "";
+  let recommendations: string[] = [];
+
+  const suffix = " (Automated reflection; it uses simple keyword rules, not a therapist or medical advice, and can misread your entries.)";
+
+  if (insightType === "weekly_summary") {
+    insight_text = tone === "warm"
+      ? `Your entries this week include words associated with ${emotions.slice(0, 2).join(" and ") || "reflection"}. Showing up to write regularly takes care and courage. These reflections are observations from keyword matching, not a professional assessment.${suffix}`
+      : `Summary of this week's entries: word associations include ${emotions.slice(0, 2).join(", ") || "reflective"}. ${wordCount} words analyzed. This is a keyword-based summary, not a clinical assessment.${suffix}`;
     recommendations = [
-      'Schedule a brief 5-minute morning check-in to set an emotional intention for the day',
-      'Notice any recurring themes in your entries — they often point to areas where growth is naturally emerging',
-      'Celebrate the consistency of your reflection practice; it takes genuine courage to look inward regularly',
+      "A brief morning check-in can help set an intention for the day",
+      "Recurring words across entries may point to themes worth noticing",
+      "Consistency in reflection is worth acknowledging",
     ];
-  } else if (insightType === 'burnout_warning') {
-    insight_text = `Your recent entries and mood patterns show indicators of emotional and mental fatigue. This is an important signal from your system asking for rest and restoration. Burnout doesn't announce itself clearly — it creeps in gradually. Recognizing these early signs is powerful self-awareness in action. It's time to be gentle with your expectations and generous with your recovery.`;
+  } else if (insightType === "burnout_warning") {
+    insight_text = tone === "warm"
+      ? `Your recent entries and mood patterns include words associated with fatigue and stress. This may be a signal worth paying attention to. These keyword-based observations are not a diagnosis; if this resonates, consider being gentle with your expectations and resting when you can.${suffix}`
+      : `Pattern: recent entries show word associations with fatigue/stress and a lower estimated mood score. This is a keyword-based estimate, not a diagnosis. If consistent, consider reducing load and prioritizing rest.${suffix}`;
     recommendations = [
-      'Identify one major commitment you can temporarily step back from or delegate',
-      'Prioritize sleep quality above productivity for the next 72 hours',
-      'Practice a brief body-scan meditation to reconnect with physical sensations of tension',
-      'Schedule one fully restorative activity with zero productivity expectations this week',
+      "Consider whether one commitment could be paused or delegated",
+      "Prioritizing sleep may be more useful than pushing through",
+      "A brief body-scan or rest practice may help you notice tension",
     ];
-  } else if (insightType === 'encouragement') {
-    insight_text = `What you're doing — choosing to reflect, to show up, to examine your inner world — takes more courage than most people realize. Every entry you write is an act of emotional bravery. The simple act of naming your experience gives it form, and in that form, you find the ability to respond rather than just react. You are building something meaningful here.`;
+  } else if (insightType === "encouragement") {
+    insight_text = tone === "warm"
+      ? `Choosing to reflect and write takes courage. The act of naming your experience can be meaningful on its own. Your entry includes words associated with ${emotions.slice(0, 2).join(" and ") || "reflection"}. This is an observation from keyword matching, not a professional judgment.${suffix}`
+      : `Observation: your entry includes words associated with ${emotions.slice(0, 2).join(" and ") || "reflection"}. Regular reflection is a consistent practice. This is keyword-based, not an assessment.${suffix}`;
     recommendations = [
-      'Acknowledge one genuine strength you demonstrated this week',
-      'Share your reflection practice with someone you trust — vulnerability builds connection',
-      'Notice what environments or activities restore your energy most effectively',
+      "Consider acknowledging one strength you noticed this week",
+      "Sharing your practice with someone you trust can complement it",
+      "Noting what restores your energy may be useful for future reference",
     ];
   } else if (hasAnxiety) {
-    insight_text = `Your entry carries threads of anxiety and worry, which your mind is actively working to process. This is the nervous system doing its job — scanning for threats and preparing responses. What's notable is your awareness: you're observing the anxiety rather than being entirely consumed by it. That observer perspective is the beginning of regulation. The ${wordCount > 100 ? 'depth and length' : 'quality'} of your reflection suggests genuine emotional intelligence at work.`;
+    insight_text = tone === "warm"
+      ? `Your entry includes words associated with anxiety and worry. It can be hard to sit with those feelings; noticing them is a meaningful step. The rules detected these associations from keywords and may misread your meaning.${suffix}`
+      : `Word associations: anxiety/worry. Your ${wordCount}-word entry was matched against keyword lists; this is not a clinical reading.${suffix}`;
     recommendations = [
-      'Try the 5-4-3-2-1 grounding technique: name 5 things you can see, 4 you can touch, 3 you can hear',
-      'Identify whether this anxiety is about a specific situation or a more diffuse state',
-      'Write down the worst and best possible outcomes of your current concern to contextualize it',
-      'Consider a brief walk in nature or gentle movement to discharge anxious energy physically',
+      "A grounding exercise (e.g. naming 5 things you can see) is an option some find helpful",
+      "Consider whether this relates to a specific situation or a more general state",
+      "Noting the best and worst possible outcomes can sometimes contextualize a worry",
     ];
   } else if (hasSadness) {
-    insight_text = `There's a quietness in your entry today — a gentleness that comes with sadness. Sadness is not weakness; it's the emotional signature of caring deeply, of valuing what has been lost or what hasn't yet arrived. Your willingness to sit with this feeling rather than escape it speaks to an emotional maturity that will serve you well. Give yourself permission to feel this fully without judgment.`;
+    insight_text = tone === "warm"
+      ? `Your entry includes words associated with sadness. Sadness can reflect caring deeply about something. These are keyword associations, not an assessment of how you are actually doing.${suffix}`
+      : `Word associations: sadness/low mood. Detected via keyword matching; not a clinical assessment.${suffix}`;
     recommendations = [
-      'Allow yourself brief, intentional "grief windows" rather than pushing feelings away or drowning in them',
-      'Reach out to someone who feels safe — connection is medicine for sadness',
-      'Engage in gentle, sensory activities: warm tea, soft music, natural light',
-      'Journal again tomorrow — tracking the movement of emotions over days is insightful',
+      "Brief, intentional windows to feel — rather than pushing feelings away — are an option",
+      "If it would help, consider reaching out to someone who feels safe",
+      "Gentle sensory activities (warm tea, soft music) are worth trying",
     ];
   } else if (hasJoy || hasCalmness) {
-    insight_text = `There's genuine brightness in your entry today. ${hasJoy ? 'Joy' : 'Calm'} is a state worth savoring and studying — understanding what creates it helps you return to it more intentionally. Your emotional tone suggests a nervous system in a regulated, open state: the ideal condition for creativity, connection, and clear thinking. This is worth noting and celebrating.`;
+    insight_text = tone === "warm"
+      ? `Your entry includes words associated with ${hasJoy ? "joy" : "calm"}. It can be worth noticing what surrounds those feelings. These are keyword associations, not a measure of your actual state.${suffix}`
+      : `Word associations: ${hasJoy ? "positive affect" : "calm"}. Keyword-based; not an assessment.${suffix}`;
     recommendations = [
-      'Document what specifically contributed to this positive emotional state for future reference',
-      'This is an excellent time to tackle something challenging or creative — your cognitive resources are high',
-      'Share your positive energy with someone who might benefit from your presence today',
+      "Consider documenting what may have contributed to this state",
+      "This may be a good time for something creative or challenging — only if it feels right",
+      "Sharing positive energy with someone is an option",
     ];
   } else if (hasFatigue) {
-    insight_text = `Your words carry the weight of genuine tiredness today. Fatigue isn't just physical — it's your whole system asking for restoration. There's wisdom in recognizing this rather than pushing through on willpower alone. Rest is not the absence of productivity; it is the condition that makes sustainable performance possible. Honor what your body and mind are telling you.`;
+    insight_text = tone === "warm"
+      ? `Your entry includes words associated with tiredness and fatigue. There can be wisdom in recognizing this rather than pushing through. This is a keyword-based observation, not a judgment about what you should do.${suffix}`
+      : `Word associations: fatigue/tiredness. Keyword-based detection; not a clinical assessment.${suffix}`;
     recommendations = [
-      'Audit your energy drains — identify one thing you can eliminate, defer, or delegate',
-      'Prioritize sleep hygiene tonight: cool room, minimal screens 1 hour before bed',
-      'Even 10 minutes of genuine rest (not scrolling) can shift your nervous system state',
-      'Nourish yourself with something simple and restorative today — food, movement, or stillness',
+      "Consider auditing energy drains and whether one can be reduced",
+      "Prioritizing sleep hygiene tonight is an option",
+      "Even a few minutes of genuine rest can help",
     ];
   } else if (hasHope || hasReflection) {
-    insight_text = `Your entry today reflects a mind in active, healthy engagement with your own experience. The ${hasHope ? 'hope and forward orientation' : 'quality of reflection'} present in your words indicates emotional resilience and an open, growth-oriented perspective. This is precisely the mindset that drives meaningful personal development. Whatever you're working through or moving toward, you're approaching it with clarity.`;
+    insight_text = tone === "warm"
+      ? `Your entry includes words associated with ${hasHope ? "hope and forward-looking language" : "reflection"}. This kind of engagement with your experience can be meaningful. These are keyword observations, not a professional reading.${suffix}`
+      : `Word associations: ${hasHope ? "hope" : "reflection"}. Keyword-based; not an assessment.${suffix}`;
     recommendations = [
-      'Capture any specific insights or realizations from this entry in a dedicated "growth notes" section',
-      'Set one small, concrete intention aligned with the positive energy you are feeling',
-      'Continue this reflection practice consistently — compound returns build over weeks and months',
+      "Consider capturing any specific realization in a dedicated notes section",
+      "One small, concrete intention aligned with this energy is an option",
+      "Continuing the practice consistently may build a fuller picture over time",
     ];
   } else {
-    insight_text = `Your entry today carries thoughtful energy — a mind processing, questioning, and seeking understanding. This kind of reflective practice is rare and genuinely powerful. Even on days when emotions feel unclear or mixed, the act of writing creates neural pathways for emotional regulation. You're building something important here, one entry at a time. The quality of your presence to your own experience is worth acknowledging.`;
+    insight_text = tone === "warm"
+      ? `Your entry includes words associated with reflective thinking. Even when emotions feel mixed or unclear, writing can be a useful practice. These are keyword observations, not a measure of your actual wellbeing.${suffix}`
+      : `Word associations: reflective thinking. ${wordCount} words analyzed via keyword matching; no strong emotion clusters detected. Not an assessment.${suffix}`;
     recommendations = [
-      'Sit quietly for 3 minutes after writing and notice what arises without judgment',
-      'Look for one recurring pattern or theme across your recent entries',
-      'Ask yourself: "What would I tell a close friend who shared exactly this experience?"',
+      "Sitting quietly for a few minutes after writing and noticing what arises is an option",
+      "Looking for recurring themes across recent entries can be useful",
+      "Asking yourself what you would tell a friend in the same situation is a reflection prompt",
     ];
   }
 
@@ -250,60 +363,111 @@ function generateInsight(content: string, mood: string | undefined, emotions: st
 }
 
 Deno.serve(async (req: Request) => {
+  const origin = req.headers.get("Origin");
+  const headers = corsHeaders(origin);
+
   if (req.method === "OPTIONS") {
-    return new Response(null, { status: 200, headers: corsHeaders });
+    return new Response(null, { status: 200, headers });
   }
 
   try {
-    const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
-    const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-    const supabase = createClient(supabaseUrl, supabaseKey);
-
-    const body: AnalyzeRequest = await req.json();
-    const { content = '', mood, userId, journalEntryId, moodEntryId, insightType = 'reflection' } = body;
-
-    if (!userId) {
-      return new Response(JSON.stringify({ error: 'userId is required' }), {
-        status: 400,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    // ---- Verify JWT from Authorization header ----
+    const authHeader = req.headers.get("Authorization") || "";
+    const token = authHeader.replace("Bearer ", "").trim();
+    if (!token) {
+      return new Response(JSON.stringify({ error: "Missing authorization token" }), {
+        status: 401,
+        headers: { ...headers, "Content-Type": "application/json" },
       });
     }
 
-    // Fetch all of today's moods for daily summary aggregation
+    const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
+    const supabaseAnonKey = Deno.env.get("SUPABASE_ANON_KEY")!;
+    const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+
+    // Use the user's JWT to identify them — NOT a userId from the body.
+    const userClient = createClient(supabaseUrl, supabaseAnonKey, {
+      global: { headers: { Authorization: `Bearer ${token}` } },
+    });
+    const { data: { user }, error: userError } = await userClient.auth.getUser();
+    if (userError || !user) {
+      return new Response(JSON.stringify({ error: "Invalid or expired token" }), {
+        status: 401,
+        headers: { ...headers, "Content-Type": "application/json" },
+      });
+    }
+    const userId = user.id; // derived from JWT, body userId is ignored
+
+    // Service-role client for DB writes
+    const admin = createClient(supabaseUrl, supabaseServiceKey);
+
+    // Fetch the user's profile to read tone preference
+    const { data: profile } = await admin
+      .from("profiles")
+      .select("reflection_tone")
+      .eq("id", userId)
+      .maybeSingle();
+    const tone: Tone = profile?.reflection_tone === "neutral" ? "neutral" : "warm";
+
+    const body: AnalyzeRequest = await req.json();
+    const { content = "", mood, journalEntryId, moodEntryId, insightType = "reflection" } = body;
+
+    // ---- Crisis check BEFORE any normal insight/score ----
+    if (isCrisis(content)) {
+      const crisis = crisisResponse();
+      // Still record a flagged insight so the user can see the supportive
+      // message in their feed, but with NO score or analytics.
+      const { data: created } = await admin
+        .from("ai_insights")
+        .insert({
+          user_id: userId,
+          journal_entry_id: journalEntryId || null,
+          mood_entry_id: moodEntryId || null,
+          insight_type: "reflection",
+          emotional_tone: crisis.emotional_tone,
+          primary_emotions: crisis.primary_emotions,
+          insight_text: crisis.insight_text,
+          recommendations: crisis.recommendations,
+          wellness_score: null,
+        })
+        .select()
+        .single();
+      return new Response(JSON.stringify({ ...crisis, insight: created }), {
+        headers: { ...headers, "Content-Type": "application/json" },
+      });
+    }
+
+    // Fetch today's moods for daily summary
     let moodHistory: MoodRecord[] = [];
-    if (insightType === 'daily_summary') {
-      const today = new Date().toISOString().split('T')[0];
-      const { data: todayMoods } = await supabase
-        .from('mood_entries')
-        .select('mood, intensity, note, created_at')
-        .eq('user_id', userId)
-        .eq('entry_date', today)
-        .order('created_at', { ascending: true });
+    if (insightType === "daily_summary") {
+      const today = new Date().toISOString().split("T")[0];
+      const { data: todayMoods } = await admin
+        .from("mood_entries")
+        .select("mood, intensity, note, created_at")
+        .eq("user_id", userId)
+        .eq("entry_date", today)
+        .order("created_at", { ascending: true });
       moodHistory = (todayMoods as MoodRecord[]) || [];
     }
 
-    const emotions = detectEmotions(content);
-    const wellnessScore = calculateWellnessScore(content, mood, emotions, insightType === 'daily_summary' ? moodHistory : undefined);
-    const { insight_text, recommendations, emotional_tone } = generateInsight(content, mood, emotions, insightType, moodHistory);
+    const { emotions, negated } = detectEmotions(content);
+    const moodScore = calculateMoodScore(content, mood, emotions, negated, insightType === "daily_summary" ? moodHistory : undefined);
+    const { insight_text, recommendations, emotional_tone } = generateInsight(content, mood, emotions, negated, insightType, tone, moodHistory);
 
-    // For daily_summary, upsert the existing daily summary instead of creating duplicates
     let insight;
-
-    if (insightType === 'daily_summary') {
-      // Check if a daily summary already exists today
-      const today = new Date().toISOString().split('T')[0];
-      const { data: existing } = await supabase
-        .from('ai_insights')
-        .select('id')
-        .eq('user_id', userId)
-        .eq('insight_type', 'daily_summary')
-        .gte('created_at', today)
+    if (insightType === "daily_summary") {
+      const today = new Date().toISOString().split("T")[0];
+      const { data: existing } = await admin
+        .from("ai_insights")
+        .select("id")
+        .eq("user_id", userId)
+        .eq("insight_type", "daily_summary")
+        .gte("created_at", today)
         .maybeSingle();
 
       if (existing) {
-        // Update existing daily summary
-        const { data: updated, error } = await supabase
-          .from('ai_insights')
+        const { data: updated, error } = await admin
+          .from("ai_insights")
           .update({
             journal_entry_id: journalEntryId || null,
             mood_entry_id: moodEntryId || null,
@@ -311,23 +475,21 @@ Deno.serve(async (req: Request) => {
             primary_emotions: emotions,
             insight_text,
             recommendations,
-            wellness_score: wellnessScore,
+            wellness_score: moodScore,
           })
-          .eq('id', existing.id)
+          .eq("id", existing.id)
           .select()
           .single();
-
         if (error) {
-          return new Response(JSON.stringify({ error: 'Failed to update insight', details: error.message }), {
+          return new Response(JSON.stringify({ error: "Failed to update reflection" }), {
             status: 500,
-            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+            headers: { ...headers, "Content-Type": "application/json" },
           });
         }
         insight = updated;
       } else {
-        // Create new daily summary
-        const { data: created, error } = await supabase
-          .from('ai_insights')
+        const { data: created, error } = await admin
+          .from("ai_insights")
           .insert({
             user_id: userId,
             journal_entry_id: journalEntryId || null,
@@ -337,23 +499,21 @@ Deno.serve(async (req: Request) => {
             primary_emotions: emotions,
             insight_text,
             recommendations,
-            wellness_score: wellnessScore,
+            wellness_score: moodScore,
           })
           .select()
           .single();
-
         if (error) {
-          return new Response(JSON.stringify({ error: 'Failed to save insight', details: error.message }), {
+          return new Response(JSON.stringify({ error: "Failed to save reflection" }), {
             status: 500,
-            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+            headers: { ...headers, "Content-Type": "application/json" },
           });
         }
         insight = created;
       }
     } else {
-      // Regular per-entry insight
-      const { data: created, error } = await supabase
-        .from('ai_insights')
+      const { data: created, error } = await admin
+        .from("ai_insights")
         .insert({
           user_id: userId,
           journal_entry_id: journalEntryId || null,
@@ -363,27 +523,28 @@ Deno.serve(async (req: Request) => {
           primary_emotions: emotions,
           insight_text,
           recommendations,
-          wellness_score: wellnessScore,
+          wellness_score: moodScore,
         })
         .select()
         .single();
-
       if (error) {
-        return new Response(JSON.stringify({ error: 'Failed to save insight', details: error.message }), {
+        return new Response(JSON.stringify({ error: "Failed to save reflection" }), {
           status: 500,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          headers: { ...headers, "Content-Type": "application/json" },
         });
       }
       insight = created;
     }
 
     return new Response(JSON.stringify(insight), {
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      headers: { ...headers, "Content-Type": "application/json" },
     });
   } catch (err) {
-    return new Response(JSON.stringify({ error: 'Internal server error', details: String(err) }), {
+    const origin = req.headers.get("Origin");
+    const headers = corsHeaders(origin);
+    return new Response(JSON.stringify({ error: "Internal server error" }), {
       status: 500,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      headers: { ...headers, "Content-Type": "application/json" },
     });
   }
 });
